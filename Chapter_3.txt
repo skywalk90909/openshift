@@ -1,0 +1,153 @@
+3.1 — SDN with VMs (Already covered above)
+Quick recap in one line: VM lives inside a pod → gets pod network IP → talks via Service VIP → exposed via Route. That's your baseline for everything below.
+
+3.2 & 3.4 — Configure Networking Between VMs
+Scenario: You have VM-A (database) and VM-B (app server). VM-B needs to talk to VM-A.
+
+text
+VM-B (virt-launcher pod: 10.128.1.5)
+     │
+     │  calls → mysql-service.default.svc.cluster.local
+     ▼
+MySQL Service VIP (172.30.2.10)   ← ClusterIP, internal only
+     │
+     ▼
+VM-A (virt-launcher pod: 10.129.3.8)
+     │
+     ▼
+     MySQL running inside VM-A
+You create a Service pointing to VM-A using a label selector
+
+VM-B never talks directly to 10.129.3.8 — always through the Service VIP
+
+If VM-A migrates to another node (live migration), it gets a new pod IP — VM-B doesn't care, Service VIP stays the same
+
+3.3 — Multus CNI: Giving a VM a Second NIC
+Problem with default SDN: Your VM talks to other pods fine, but it cannot get a direct IP on your physical VLAN (e.g., 192.168.10.x). The SDN uses NAT and rewrites IPs.
+
+Multus solves this — it's like adding a second physical NIC to your VM that plugs directly into your datacenter's switch/VLAN.
+
+text
+                    ┌─────────────────────────────┐
+VM                  │  eth0 → Pod Network (SDN)   │  ← talks to other pods/services
+(inside             │         10.128.x.x           │
+virt-launcher)      ├─────────────────────────────┤
+                    │  eth1 → Physical VLAN        │  ← direct IP from your datacenter
+                    │         192.168.10.55        │  ← SSH, RDP, legacy app traffic
+                    └─────────────────────────────┘
+How it's wired — 3 layers:
+
+text
+Physical NIC on Node (eno1)
+     │
+     ▼
+Linux Bridge (br0)          ← created via NMState on the node
+     │
+     ▼
+NetworkAttachmentDefinition  ← Multus config (NAD yaml) — defines the bridge
+     │
+     ▼
+VM gets eth1 with 192.168.10.55   ← direct VLAN IP, no NAT
+NMState = configures the bridge on the node level (like your /etc/sysconfig/network-scripts but declarative YAML)
+
+Multus NAD = tells OpenShift "attach this bridge as a second NIC to the VM"
+
+Result: Your legacy team can SSH directly to 192.168.10.55 — just like before migration from VMware
+
+3.5 & 3.6 — User-Defined Networks (UDN)
+Problem: By default, all pods/VMs in the cluster share the same pod network. A VM in namespace-A can talk to a VM in namespace-B — which is a security risk for multi-tenant environments.
+
+User-Defined Network = your own private VLAN per namespace
+
+text
+namespace: finance-team
+     └── VM-1, VM-2, VM-3  →  UDN: 10.200.1.0/24  (isolated)
+                                    ↕ can talk to each other
+                                    ✗ cannot reach namespace: hr-team
+
+namespace: hr-team
+     └── VM-A, VM-B         →  UDN: 10.200.2.0/24  (isolated)
+Without UDN: finance VM can accidentally reach HR VM over the shared pod network
+
+With UDN: complete isolation — just like putting them on separate VLANs in your datacenter
+
+You can also span a UDN across namespaces if two teams need to talk securely
+
+3.7 & 3.8 — External Access to VMs
+Scenario: Your VM runs a web app. External users need to reach it.
+
+For HTTP/HTTPS traffic:
+text
+User Browser → Route (app.example.com) → Service VIP → virt-launcher Pod → VM
+Standard Route — same as containers. Works only for ports 80/443.
+
+For non-HTTP (SSH, RDP, custom ports):
+text
+External User (SSH port 22)
+     │
+     ▼
+NodePort Service (NodeIP:30022)   ← any node's IP, fixed port
+     │
+     ▼
+virt-launcher Pod → VM (port 22)
+Traffic hits any node's IP on port 30022, gets forwarded into the VM.
+
+3.9 & 3.10 — LoadBalancer Service for External VM Access
+NodePort problem: You're exposing the node's IP — if that node goes down, access breaks. You need a stable external IP.
+
+LoadBalancer Service (MetalLB in on-prem):
+
+text
+External User
+     │
+     ▼
+MetalLB assigns stable External IP → e.g., 10.50.0.200
+     │
+     ▼
+LoadBalancer Service
+     │
+     ▼
+virt-launcher Pod → VM (SSH port 22)
+bash
+# Expose VM via LoadBalancer for SSH
+oc expose vm my-rhel-vm --port=22 --type=LoadBalancer
+# External IP: 10.50.0.200
+ssh user@10.50.0.200
+MetalLB is the on-prem equivalent of AWS ELB — it advertises the external IP via BGP or ARP
+
+The external IP is stable — survives pod/VM restarts, live migrations, node failures
+
+3.11 & 3.12 — Multihomed VMs
+Scenario: Your VM needs to be on two networks simultaneously — pod network for internal cluster traffic AND a physical VLAN for direct external access.
+
+text
+                   ┌──────────────────────────────────────┐
+                   │              VM                       │
+External           │  eth0 (SDN)      eth1 (Physical VLAN) │
+SSH User ─────────▶│  10.128.x.x      192.168.10.55        │◀──── Internal pods
+                   │  (cluster comms)  (direct access)     │
+                   └──────────────────────────────────────┘
+eth0 (default pod network) handles traffic to/from other pods and services inside the cluster
+
+eth1 (Multus secondary NIC) handles direct traffic from your physical network — SSH, RDP, database connections from on-prem systems
+
+This is exactly how your VMware VMs had a management NIC and a data NIC — same concept, now in OpenShift
+
+The Full Chapter 3 Flow in One Picture
+text
+Physical VLAN User
+(SSH / RDP)          MetalLB IP or          Browser
+      │              Multus eth1 IP            │
+      │                    │                   │
+      ▼                    ▼                   ▼
+LoadBalancer Svc    Direct VLAN IP         Route (HTTP/S)
+      │                    │                   │
+      └──────────┬──────────┘                  │
+                 ▼                             ▼
+         virt-launcher Pod ←────── ClusterIP Service VIP
+                 │                   (internal VM-to-VM)
+                 ▼
+              VM (eth0=SDN, eth1=VLAN)
+                 │
+                 ▼
+          DB / App inside VM
