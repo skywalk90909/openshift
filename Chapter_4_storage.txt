@@ -1,0 +1,190 @@
+The Core Idea: VMs Need Disks, Disks Come from Storage
+In VMware, your VM disk is a .vmdk file sitting on a datastore. In OpenShift, the equivalent is a PVC (Persistent Volume Claim) — it's just a storage request that gets fulfilled by a storage backend (Ceph, NFS, AWS EBS, etc.). Every VM in OpenShift Virtualization has at least one PVC as its disk.
+
+4.1 & 4.2 — Attaching Persistent Storage to a VM
+Scenario: You deployed a RHEL VM. By default it has a root disk. Now you want to attach a second disk — like adding a /data volume for application logs.
+
+The flow — 3 layers between VM and physical storage:
+
+text
+VM (sees it as /dev/vdb)
+     │
+     ▼
+PVC (Persistent Volume Claim)   ← your storage request: "give me 50Gi"
+     │
+     ▼
+PV (Persistent Volume)          ← actual storage allocated by admin/provisioner
+     │
+     ▼
+Storage Backend (Ceph RBD / NFS / AWS EBS)   ← physical or cloud storage
+PVC = like raising a ticket saying "I need a 50GB disk"
+
+PV = storage admin fulfills that ticket by carving out 50GB from Ceph or NFS
+
+OpenShift's storage provisioner handles this automatically with dynamic provisioning — no manual PV creation needed
+
+You can hot-plug the PVC to a running VM without rebooting — like hot-adding a disk in VMware
+
+bash
+# Attach a new 50Gi disk to a running VM
+virtctl addvolume my-rhel-vm --volume-name=data-disk \
+  --pvc-name=my-data-pvc
+# VM sees it instantly as /dev/vdb
+4.3 & 4.4 — Managing Storage Devices on VMs
+Scenario: Your VM now has two disks — root disk (/dev/vda) and data disk (/dev/vdb). You need to manage them — resize, detach, swap.
+
+The full device path from VM to storage:
+
+text
+VM inside virt-launcher pod
+  └── /dev/vda  (root disk, 30Gi)   ──▶ PVC: vm-rootdisk    ──▶ Ceph RBD
+  └── /dev/vdb  (data disk, 50Gi)   ──▶ PVC: vm-datadisk    ──▶ Ceph RBD
+  └── /dev/vdc  (cdrom/ISO)         ──▶ PVC: windows-iso    ──▶ NFS
+Each PVC is independently managed — you can detach /dev/vdb without touching /dev/vda
+
+Access Modes control who can mount it:
+
+Access Mode	Meaning	Use Case
+ReadWriteOnce (RWO)	One node at a time	Single VM root disk
+ReadWriteMany (RWX)	Multiple nodes simultaneously	Shared storage, live migration
+ReadOnlyMany (ROX)	Many nodes, read only	ISO/image distribution
+For live migration to work, your VM's root disk PVC must be RWX — otherwise the VM is locked to one node
+
+4.5 & 4.6 — Exporting and Importing VMs
+Scenario: You want to migrate a VM from your old VMware environment into OpenShift, OR export an OpenShift VM to share with another cluster.
+
+Importing (VMware → OpenShift):
+text
+VMware VMDK / OVA / qcow2 image
+     │
+     ▼
+CDI (Containerized Data Importer)   ← OpenShift's built-in import engine
+     │   pulls from HTTP URL / upload / S3 / registry
+     ▼
+PVC created with disk image inside
+     │
+     ▼
+VM created using that PVC as root disk
+CDI is the key component — it acts like a data pipeline that pulls VM disk images from any source and converts them into a PVC
+
+You describe what you want with a DataVolume manifest — CDI handles the rest:
+
+text
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: rhel-imported-vm
+spec:
+  source:
+    http:
+      url: "https://myserver.com/rhel9.qcow2"  # source image URL
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 30Gi
+CDI downloads the qcow2, converts it, and lands it as a ready-to-use PVC.
+
+Exporting (OpenShift → outside):
+text
+VM (stopped or running)
+     │
+     ▼
+VirtualMachineExport resource created
+     │
+     ▼
+Export server pod spins up temporarily
+     │
+     ▼
+You download VM manifests + disk image via HTTPS
+     │
+     ▼
+Import into another cluster or store as backup
+4.7 & 4.8 — VM Snapshots
+Scenario: You're about to patch your RHEL VM. You want a restore point — exactly like VMware snapshots.
+
+What a snapshot captures:
+
+text
+VM Snapshot
+  ├── VirtualMachine spec (CPU, RAM, device config)
+  └── VolumeSnapshot of each PVC (point-in-time disk state)
+          │
+          ▼
+     Storage backend takes a COW (Copy-on-Write) snapshot
+     (Ceph, Trident, etc. must support VolumeSnapshot CSI driver)
+Snapshot flow:
+
+text
+VM running normally
+     │
+     │  oc snapshot taken
+     ▼
+Storage backend freezes writes momentarily → copies metadata pointer
+     │
+     ▼
+Snapshot stored (no full copy — only changed blocks tracked going forward)
+     │
+     │  Patch goes wrong → restore
+     ▼
+VM reverts to snapshot state — disk + config both rolled back
+Snapshots are crash-consistent by default; if VMware guest agent is installed inside VM, they become application-consistent (quiesced)
+
+Restoring creates a new PVC from the VolumeSnapshot, then rebuilds the VM on top of it
+
+bash
+# Take a snapshot
+virtctl snapshot my-rhel-vm --name=pre-patch-snapshot
+
+# Restore snapshot
+virtctl restore my-rhel-vm --vm-snapshot-name=pre-patch-snapshot
+4.9 & 4.10 — Cloning VMs
+Scenario: You have a golden RHEL 9 VM template fully patched and configured. You want to spin up 10 dev VMs from it — like deploying from a VMware template.
+
+Two types of cloning — different flows:
+
+Clone from existing VM:
+text
+Source VM's PVC (golden-rhel9-disk)
+     │
+     ▼
+CDI PVC Cloner kicks in
+     │   (uses CSI Clone or smart-clone if storage supports it — near-instant)
+     ▼
+New PVC (dev-vm-01-disk)   ← full independent copy
+     │
+     ▼
+New VM (dev-vm-01) boots from cloned PVC
+Clone from DataSource / Boot Source (for catalog VMs):
+text
+OpenShift Virtualization Catalog
+  └── "RHEL 9" template  ──▶  points to DataSource
+                                    │
+                                    ▼
+                               PVC clone created per VM automatically
+                                    │
+                                    ▼
+                              New VM boots
+Smart Clone = if the storage backend supports CSI volume cloning (Ceph, NetApp), the clone is near-instant — just metadata pointer, no full data copy
+
+Host-assisted Clone = if storage doesn't support CSI clone, CDI copies block-by-block — slower but works everywhere
+
+Full Chapter 4 Flow in One Picture
+text
+External Image (qcow2/OVA)
+        │
+        ▼ CDI imports
+       PVC ◀──────── Snapshot (restore point)
+        │                    ▲
+        │                    │ snapshot taken
+        ▼                    │
+   virt-launcher Pod ────────┘
+        │
+        ▼
+     VM (/dev/vda = root PVC, /dev/vdb = data PVC)
+        │
+        ▼ clone
+   New PVC ──▶ New VM (dev/test clone)
+        │
+        ▼ export
+   VirtualMachineExport ──▶ Download / Backup / Migrate
