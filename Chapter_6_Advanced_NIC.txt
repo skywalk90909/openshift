@@ -1,0 +1,194 @@
+The Core Idea: Chapter 6 is About Control and Isolation
+Chapter 3 taught you how traffic flows. Chapter 6 answers: "How do you control WHO can talk to WHAT, on WHICH network, using WHICH physical NIC?"
+
+6.1 & 6.2 — Cluster User-Defined Networks (CUDN)
+Problem: In a default OpenShift cluster, all VMs across all namespaces share the same pod network (10.8.0.0/14). A VM in the finance namespace can reach a VM in the hr namespace freely — no isolation by default.
+
+CUDN = Span a private isolated network ACROSS multiple namespaces.
+
+Think of it like creating a dedicated private VLAN that only specific teams/namespaces are plugged into.
+
+text
+Default Pod Network (shared by everyone)
+  ├── namespace: finance  (VM-1, VM-2)
+  ├── namespace: hr       (VM-3, VM-4)
+  └── namespace: payments (VM-5, VM-6)
+              ↕ ALL can reach each other ← PROBLEM
+
+─────────────────────────────────────────
+
+With CUDN (Cluster User-Defined Network):
+
+CUDN: banking-net (10.200.1.0/24)
+  ├── namespace: finance  (VM-1, VM-2) ──▶ isolated island
+  └── namespace: payments (VM-5, VM-6) ──▶ same island, talk to each other
+
+namespace: hr (VM-3, VM-4) ──▶ completely separate, CANNOT reach banking-net
+CUDN spans across namespaces — unlike regular UDN which is one namespace only
+
+Uses OVN-Kubernetes Layer 2 or Layer 3 topology underneath
+
+Each namespace in the CUDN must be labeled at creation time — you cannot add the label after the fact
+
+text
+# Label the namespace to join the CUDN
+kubectl label namespace finance \
+  k8s.ovn.org/primary-user-defined-network=banking-net
+
+# Create the ClusterUserDefinedNetwork
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: banking-net
+spec:
+  namespaceSelector:
+    matchLabels:
+      k8s.ovn.org/primary-user-defined-network: banking-net
+  network:
+    topology: Layer2
+    layer2:
+      role: Primary
+      subnets: ["10.200.1.0/24"]
+6.3 & 6.4 — Network Policy: Firewall Rules for VM Traffic
+Problem: Even within the same namespace, you may not want every VM to talk to every other VM. Example: your web-vm should reach app-vm, but app-vm should NEVER directly reach web-vm.
+
+NetworkPolicy = iptables/firewall rules, but defined in YAML, enforced by OVN.
+
+text
+WITHOUT NetworkPolicy:
+web-vm  ◀──▶  app-vm  ◀──▶  db-vm    (all traffic open)
+
+WITH NetworkPolicy:
+web-vm  ──▶  app-vm  ──▶  db-vm      (one-way only, enforced)
+web-vm  ✗◀── app-vm                   (blocked)
+app-vm  ✗◀── db-vm                    (blocked)
+Real scenario — 3-tier app, lock it down:
+
+text
+# Step 1: Default deny ALL traffic in the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}       # applies to ALL pods/VMs
+  policyTypes:
+  - Ingress
+  - Egress
+text
+# Step 2: Allow ONLY web-vm → app-vm on port 8080
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-to-app
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      role: app-vm          # this policy protects app-vm
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: web-vm      # only web-vm can send traffic in
+    ports:
+    - port: 8080
+Once a NetworkPolicy selects a pod/VM, implicit deny-all kicks in — only explicitly allowed traffic passes
+
+Policies are additive — you can stack multiple policies for complex rules
+
+This is your Security Group equivalent in OpenShift — just like AWS SG or VMware NSX micro-segmentation
+
+6.5 & 6.6 — Multihomed Nodes
+Problem: Your OpenShift nodes themselves need to carry multiple types of traffic — cluster management traffic, VM data traffic, storage traffic — all on separate physical NICs. Mixing them on one NIC causes congestion and security issues.
+
+Multihomed Node = your node has 2+ NICs, each dedicated to a specific traffic type.
+
+text
+OpenShift Node (Worker)
+  ├── ens3  (10.0.0.x)   ──▶ Cluster management / pod SDN traffic
+  ├── ens4  (192.168.1.x) ──▶ VM data traffic / VLAN access (Multus)
+  └── ens5  (172.16.1.x)  ──▶ Storage traffic (iSCSI / NFS / Ceph)
+NMState configures this declaratively — like your /etc/sysconfig/network-scripts but cluster-wide YAML:
+
+text
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: worker-bond-vlan
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
+  desiredState:
+    interfaces:
+    - name: bond0                    # bond ens4 + ens5 for redundancy
+      type: bond
+      state: up
+      link-aggregation:
+        mode: active-backup
+        port: [ens4, ens5]
+    - name: bond0.100                # VLAN 100 on top of bond
+      type: vlan
+      state: up
+      vlan:
+        base-iface: bond0
+        id: 100
+This is applied to all worker nodes at once — no SSH, no manual config per node.
+
+6.7 & 6.8 — Connecting VM to External Storage
+Problem: Your VM needs to connect to your existing SAN/NAS in the datacenter — an iSCSI LUN or NFC share that lives outside the OpenShift cluster. This is not the same as a PVC — it's a raw external storage endpoint.
+
+The flow — VM to external iSCSI storage:
+
+text
+VM (virt-launcher pod)
+     │
+     │  eth1 (Multus secondary NIC — on storage VLAN)
+     ▼
+Node's ens5 (storage NIC, 172.16.1.x)
+     │
+     ▼
+Storage Network Switch (VLAN 200)
+     │
+     ▼
+iSCSI Target / NFS Server (172.16.1.100)
+     │
+     ▼
+LUN or NFS Share mounted inside VM as /dev/sdb or /mnt/data
+The VM needs a Multus secondary NIC on the storage VLAN to reach the iSCSI target directly
+
+Node must have a dedicated storage NIC configured via NMState (section 6.5)
+
+Inside the VM, you configure iSCSI initiator normally — iscsiadm commands — just like a bare-metal server
+
+This is critical for migrating VMs from VMware that were directly connected to SAN LUNs
+
+Full Chapter 6 Flow in One Picture
+text
+External Storage (iSCSI/NFS)
+        │
+        │ Storage NIC (ens5 via NMState)
+        ▼
+OpenShift Worker Node
+  ├── ens3 → Cluster SDN (pod traffic)
+  ├── ens4 → Multus Bridge (VM VLAN traffic)
+  └── ens5 → Storage Network
+        │
+        ▼
+   virt-launcher Pod
+     ├── eth0 → Pod Network (SDN) → Service VIP → other pods
+     └── eth1 → Multus NIC → Physical VLAN / Storage
+        │
+        ▼
+       VM
+        │
+   ┌────┴──────────────────┐
+   │  NetworkPolicy        │  ← controls WHO reaches this VM
+   │  (firewall rules)     │
+   └───────────────────────┘
+        │
+        ▼
+   CUDN / UDN isolation
+   (only authorized namespaces can reach this VM)
+Every section in Chapter 6 adds one more layer of control on top of the basic traffic flow: CUDN isolates namespaces → NetworkPolicy locks down ports → NMState separates node NICs → Multus attaches the right NIC to the VM → External storage reaches VM via dedicated storage NIC.
