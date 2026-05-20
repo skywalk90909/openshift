@@ -1,0 +1,147 @@
+7.1 — Migrating from Other Hypervisors (General Flow)
+MTV supports migration from:
+
+VMware vSphere
+
+Red Hat Virtualization (RHV/oVirt)
+
+Red Hat OpenStack
+
+Open Virtual Appliances (OVA files)
+
+Remote OpenShift Virtualization clusters
+
+The 5-step MTV workflow — regardless of source:
+
+text
+Step 1: Install MTV Operator
+        (OperatorHub → search "Migration Toolkit for Virtualization" → Install)
+              │
+              ▼
+Step 2: Add Source Provider
+        (Tell MTV: "Here is my VMware vCenter / RHV Manager URL + credentials")
+              │
+              ▼
+Step 3: Create Network Map
+        (Map: VMware PortGroup "VM_VLAN100" → OpenShift Multus NAD "vlan100-nad")
+              │
+              ▼
+Step 4: Create Storage Map
+        (Map: VMware Datastore "DS_SSD" → OpenShift StorageClass "ocs-ceph-rbd")
+              │
+              ▼
+Step 5: Create Migration Plan → Start
+        (Select VMs, pick Cold or Warm, click Start)
+7.2 — Guided Exercise: Migrate from Another Hypervisor
+What actually happens under the hood when you click Start:
+
+text
+MTV Controller sees Migration Plan
+     │
+     ▼
+Importer Pod spawns on OpenShift
+     │  connects to source hypervisor API
+     ▼
+Source VM disk pulled via:
+  - VMware: VDDK (Virtual Disk Development Kit) over HTTPS
+  - RHV/KVM: imageio API
+     │
+     ▼
+Disk data lands in a PVC (via CDI DataVolume)
+     │
+     ▼
+VM definition (CPU, RAM, firmware, NICs) converted
+  from VMware format → KubeVirt VirtualMachine YAML
+     │
+     ▼
+New VM created in OpenShift using the PVC as root disk
+     │
+     ▼
+VM starts — you verify, then decommission source VM
+7.3 — Migrating from VMware (Most Common Path)
+This is the most detailed section because VMware → OpenShift is the most common real-world migration scenario. Two migration types exist:
+
+Cold Migration vs Warm Migration
+Cold Migration	Warm Migration
+Source VM state	Shut down before copy starts	Stays ON during copy
+Downtime	Full downtime (hours for large disks)	Minutes only (cutover window)
+How it works	Full disk copy while VM is off	Pre-copy while VM runs → brief shutdown → copy only changed blocks
+Technology used	VDDK full disk transfer	CBT (Changed Block Tracking) tracks deltas
+Use when	Dev/test VMs, low traffic	Production VMs, SLA-sensitive
+
+Cold Migration Flow:
+text
+VMware VM (powered OFF)
+     │
+     ▼
+VDDK SDK reads VMDK disk blocks directly from datastore
+     │  (MTV uses Red Hat's VDDK init image from your registry)
+     ▼
+Importer Pod streams disk data into OpenShift PVC
+     │
+     ▼
+VM boots in OpenShift with converted YAML spec
+Warm Migration Flow (Zero-Downtime Path):
+text
+Phase 1 — PRECOPY (VM still running in VMware)
+VMware VM (running) ──▶ CBT enabled on VM disks
+     │  MTV copies full disk first time + tracks changes
+     ▼
+PVC in OpenShift gets base disk copy
+
+Phase 2 — INCREMENTAL (repeat until cutover window)
+Changed blocks only ──▶ streamed to PVC
+(VM still running in VMware, users unaffected)
+
+Phase 3 — CUTOVER (your maintenance window)
+VMware VM shuts down ──▶ final delta blocks copied ──▶ VM starts in OpenShift
+     │
+     ▼
+Total user downtime = only Phase 3 = minutes, not hours
+Critical Pre-Checks for VMware Migration:
+text
+Before running MTV plan, verify on VMware side:
+  ✔ CBT (Changed Block Tracking) enabled on each VM disk (for warm migration)
+  ✔ VMware Tools installed in VM (for clean shutdown during cutover)
+  ✔ VDDK image built and pushed to your registry
+  ✔ vCenter credentials with read access to datastore + VMs
+  ✔ Secure Boot disabled on VM (MTV cannot migrate with Secure Boot ON)
+
+On OpenShift side:
+  ✔ Multus NAD created for each source VLAN
+  ✔ StorageClass available with RWX access mode (for live migration post-import)
+Network & Storage Mapping — The Critical Step:
+text
+VMware Side                         OpenShift Side
+─────────────────────────────────────────────────────
+VM Network (VLAN 100) ──────────▶  Multus NAD (vlan100-nad)
+Storage (DS_SSD datastore) ─────▶  StorageClass (ocs-ceph-rbd)
+Storage (DS_NFS datastore) ─────▶  StorageClass (nfs-storage)
+If you keep the same VLAN, the VM retains its original IP address — no application reconfiguration needed
+
+If you map to the OpenShift SDN pod network, the VM gets a new pod IP — you need to update DNS/app configs
+
+Full Chapter 7 Flow in One Picture
+text
+VMware vCenter / RHV Manager
+  └── Source VM (VMDK disk, vNIC on VLAN100, 4CPU/8GB)
+              │
+              │ MTV reads via VDDK / imageio API
+              ▼
+     [COLD]  Full disk copy while VM is off
+     [WARM]  Pre-copy (CBT) → cutover delta copy
+              │
+              ▼
+     OpenShift PVC (converted disk, Ceph RBD backed)
+              │
+              ▼
+     VirtualMachine YAML (converted from VMware spec)
+     ├── CPU: 4, RAM: 8Gi
+     ├── Disk: PVC (root disk)
+     └── NIC: Multus NAD (vlan100-nad) → same IP retained
+              │
+              ▼
+     VM boots in OpenShift Virtualization
+              │
+              ▼
+     Verify app works → Decommission VMware VM
