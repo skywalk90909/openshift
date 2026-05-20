@@ -1,0 +1,196 @@
+8.1 & 8.2 — OpenShift APIs for Data Protection
+Three things OADP protects:
+
+text
+What OADP backs up:
+  ├── VM definition (YAML: CPU, RAM, NICs, disk references)
+  ├── PVC contents (actual disk data — via CSI snapshot or Kopia/Restic file copy)
+  └── All related Kubernetes resources (Services, ConfigMaps, Secrets in same namespace)
+Two backup methods — choose based on storage support:
+
+Method	How it works	Speed	Storage Requirement
+CSI Snapshot	Storage backend takes a point-in-time snapshot	Near-instant	Storage class must support VolumeSnapshot CSI driver (Ceph, NetApp)
+Kopia/Restic	File-level copy of PVC contents to S3	Slower	Any S3-compatible object store (AWS S3, MinIO, Noobaa)
+
+8.3 & 8.4 — Installing and Configuring OADP Operator
+Three components you configure after installing OADP:
+
+text
+Step 1: Install OADP Operator
+        OperatorHub → search "OADP" → Install in namespace: openshift-adp
+
+Step 2: Create BackupStorageLocation (BSL)
+        Tell OADP: "Store backup metadata here"
+        └── S3 bucket (AWS S3 / MinIO / Noobaa on-prem)
+
+Step 3: Create DataProtectionApplication (DPA)
+        Master config — ties everything together:
+        ├── Which backup plugins to use (kubevirt, CSI, AWS)
+        ├── BackupStorageLocation (S3 bucket details)
+        └── VolumeSnapshotLocation (where disk snapshots go)
+text
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata:
+  name: vm-backup-dpa
+  namespace: openshift-adp
+spec:
+  configuration:
+    velero:
+      defaultPlugins:
+        - kubevirt       # ← handles VM-specific backup logic
+        - csi            # ← handles PVC snapshot via CSI
+        - openshift      # ← handles OpenShift-specific resources
+    nodeAgent:
+      enable: true
+      uploaderType: kopia   # ← for file-based PVC backup to S3
+  backupLocations:
+  - velero:
+      provider: aws
+      objectStorage:
+        bucket: my-vm-backups
+        prefix: ocp-vms
+      credential:
+        name: s3-creds
+        key: cloud
+8.5 & 8.6 — Backing Up VMs
+What happens when you trigger a VM backup:
+
+text
+You create a Backup CR
+     │
+     ▼
+Velero server receives the request
+     │
+     ├── Step 1: Freeze VM (quiesce guest OS if agent present)
+     │
+     ├── Step 2: Snapshot each PVC via CSI driver
+     │           PVC → VolumeSnapshot → stored in Ceph / NetApp
+     │
+     ├── Step 3: Export VM YAML definition + all related objects
+     │           (VirtualMachine, Services, ConfigMaps) → serialized to S3
+     │
+     └── Step 4: Backup metadata written to BackupStorageLocation (S3)
+
+Backup status → Completed
+text
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: rhel-vm-backup-01
+  namespace: openshift-adp
+spec:
+  includedNamespaces:
+    - production          # backup all VMs in this namespace
+  labelSelector:
+    matchLabels:
+      vm-name: rhel-app-vm   # OR target specific VM by label
+  storageLocation: velero-sample-1
+  ttl: 720h0m0s           # retain backup for 30 days
+TTL (Time to Live) = backup auto-deleted after 30 days — like a retention policy in your backup tool
+
+You can backup a running VM — OADP freezes the filesystem momentarily using the guest agent, then resumes
+
+8.7 & 8.8 — Restoring VMs
+Two restore scenarios:
+
+Scenario A — Same cluster restore (VM accidentally deleted):
+text
+Backup in S3 (metadata + disk snapshot)
+     │
+     ▼
+You create a Restore CR
+     │
+     ▼
+Velero reads backup metadata from S3
+     │
+     ├── Recreates PVC from VolumeSnapshot → new disk
+     └── Recreates VirtualMachine YAML → VM definition restored
+     │
+     ▼
+VM powers on in the same namespace
+Scenario B — Different cluster restore (DR scenario):
+text
+Primary Cluster (disaster occurred)
+     │
+     │  Backup metadata + disk snapshots stored in shared S3
+     ▼
+DR Cluster (secondary OpenShift)
+     │
+     ├── OADP installed + same S3 BSL configured
+     ├── Velero reads backup from S3
+     ├── Restores PVC + VM definition on DR cluster
+     └── VM boots on DR cluster
+bash
+# Restore a specific VM from backup
+cat <<EOF | oc apply -f -
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: rhel-vm-restore
+  namespace: openshift-adp
+spec:
+  backupName: rhel-vm-backup-01    # which backup to restore from
+  includedNamespaces:
+    - production
+  restorePVs: true                  # restore disk data too, not just YAML
+EOF
+8.9 & 8.10 — Scheduling VM Backups
+Problem: Manual backups are unreliable. You need automated daily/weekly backups — like a cron job in Veeam.
+
+OADP Schedule CR = cron expression based automated backup:
+
+text
+Schedule CR created (cron: "0 2 * * *" = every day at 2 AM)
+     │
+     ▼
+Velero scheduler fires at 2 AM
+     │
+     ▼
+Backup CR auto-created → full backup flow runs
+     │
+     ▼
+Backup lands in S3
+     │
+     ▼
+Old backups auto-deleted after TTL expires
+text
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-vm-backup
+  namespace: openshift-adp
+spec:
+  schedule: "0 2 * * *"          # every day at 2:00 AM
+  template:
+    includedNamespaces:
+      - production
+    storageLocation: velero-sample-1
+    ttl: 168h0m0s                # retain for 7 days
+    defaultVolumesToFsBackup: true
+Full Chapter 8 Flow in One Picture
+text
+VM (running in OpenShift)
+  └── PVC (disk data)
+  └── VirtualMachine YAML (spec)
+              │
+              │ OADP Backup CR triggered (manual or scheduled)
+              ▼
+    ┌─────────────────────────────────────┐
+    │  Velero + KubeVirt Plugin           │
+    │  ├── CSI Snapshot → PVC snapshot    │
+    │  └── VM YAML exported               │
+    └─────────────┬───────────────────────┘
+                  │
+          ┌───────┴────────┐
+          ▼                ▼
+    VolumeSnapshot     S3 Bucket
+    (Ceph/NetApp)      (metadata + YAML)
+    (disk snapshot)
+          │                │
+          └───────┬────────┘
+                  │ Restore CR triggered
+                  ▼
+    Same Cluster OR DR Cluster
+    ├── PVC recreated from VolumeSnapshot
+    └── VM YAML recreated → VM boots
