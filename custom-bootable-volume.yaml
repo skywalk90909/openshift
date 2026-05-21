@@ -1,0 +1,28 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataImportCron
+metadata:
+  annotations:
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+    cdi.kubevirt.io/storage.import.storageClass: ocs-external-storagecluster-ceph-rbd-virtualization
+  labels:
+    instancetype.kubevirt.io/default-instancetype: u1.medium
+    instancetype.kubevirt.io/default-preference: rhel.9
+  name: custom-from-registry-import-cron
+  namespace: openshift-virtualization-os-images
+spec:
+  garbageCollect: Outdated
+  importsToKeep: 3
+  managedDataSource: custom-from-registry
+  schedule: 0 0 * * 2
+  template:
+    metadata: {}
+    spec:
+      source:
+        registry:
+          url: docker://registry.ocp4.example.com:8443/redhattraining/custom-boot-source:latest
+          secretRef: developer-registry-secret
+      storage:
+        resources:
+          requests:
+            storage: 10Gi
+        storageClassName: ocs-external-storagecluster-ceph-rbd-virtualization
