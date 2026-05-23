@@ -1,0 +1,182 @@
+The Core Idea: Chapter 10 is About Controlling WHERE and HOW VMs Run
+In VMware, you use DRS Rules to pin VMs to hosts, keep VMs apart, or let vMotion rebalance the cluster. Chapter 10 does the same in OpenShift using node placement rules, live migration, and the descheduler.
+
+10.1 & 10.2 — Controlling VM Placement on Nodes
+Problem: You have 6 worker nodes. 2 are bare-metal with GPU. 2 are high-memory. 2 are general purpose. You need to control which VM lands on which type of node.
+
+Three mechanisms — from simplest to most powerful:
+
+Mechanism 1: nodeSelector — Hard Pin to a Label
+text
+Node Labels:
+  worker-01: gpu=true, disktype=fast
+  worker-02: gpu=true, disktype=fast
+  worker-03: highmem=true
+  worker-04: highmem=true
+
+VM requests:
+  nodeSelector: gpu=true
+        │
+        ▼
+Scheduler ONLY places this VM on worker-01 or worker-02
+Never on worker-03 or worker-04
+Like telling vSphere: "This VM must run on the GPU host group."
+
+Mechanism 2: Affinity/Anti-Affinity — Soft or Hard Rules
+Node Affinity — "Prefer or require certain node types":
+
+text
+requiredDuringScheduling   →  HARD rule — VM won't start if no match found
+preferredDuringScheduling  →  SOFT rule — scheduler tries but not mandatory
+VM Anti-Affinity — "Keep these VMs apart from each other":
+
+text
+Scenario: 2 replicas of payment-vm. Never put both on same node.
+
+payment-vm-1  ──▶  worker-01  ✔
+payment-vm-2  ──▶  worker-01  ✗ blocked by anti-affinity rule
+payment-vm-2  ──▶  worker-02  ✔
+Exactly like VMware's "Separate Virtual Machines" DRS rule — ensures if one node crashes, your second replica survives.
+
+Mechanism 3: Taints & Tolerations — Node Repels Everything Except Chosen VMs
+text
+Node: worker-05  ← tainted: "dedicated=gpu:NoSchedule"
+      │
+      │  Only VMs with matching toleration can land here
+      ▼
+VM with toleration: "dedicated=gpu"  ──▶  ✔ Allowed on worker-05
+VM without toleration                ──▶  ✗ Repelled, goes elsewhere
+Like VMware's "Must run on" DRS rule — reserves nodes exclusively for special workloads.
+
+text
+# Full example — GPU VM pinned via all 3 mechanisms
+spec:
+  template:
+    spec:
+      nodeSelector:
+        gpu: "true"                   # hard pin to GPU nodes
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: disktype
+                operator: In
+                values: ["fast"]      # prefer fast disk, not mandatory
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                vm-type: gpu-workload
+            topologyKey: kubernetes.io/hostname  # never co-locate on same node
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "gpu"
+        effect: "NoSchedule"
+10.3 & 10.4 — Live Migrating a VM
+Scenario: Node worker-03 needs kernel patching. You need to move all VMs off it without downtime — exactly like VMware vMotion.
+
+What happens under the hood during live migration:
+
+text
+VM running on worker-03 (source node)
+     │
+     Step 1: New virt-launcher pod spawned on worker-05 (target node)
+     │       Target pod gets same PVC attached (RWX access mode REQUIRED)
+     │
+     Step 2: VM memory copied from source to target in background
+     │       VM still running, users unaffected
+     │       (iterative copy — keeps syncing dirty memory pages)
+     │
+     Step 3: Final cutover (milliseconds)
+     │       Source VM paused → final dirty pages synced → target VM resumes
+     │       Network MAC address moves with the VM
+     │
+     Step 4: Source virt-launcher pod terminated
+     │
+     ▼
+VM now running on worker-05 — ZERO downtime for users
+Key prerequisite — PVC must be RWX:
+
+text
+RWO PVC (ReadWriteOnce) → locked to one node → live migration BLOCKED
+RWX PVC (ReadWriteMany) → mountable by multiple nodes → live migration WORKS
+              │
+              └── Use Ceph RBD (RWX) or ODF for live migration support
+Trigger live migration manually or automatically:
+
+bash
+# Manual trigger
+virtctl migrate my-rhel-vm
+
+# Automatic — when node goes into maintenance mode
+oc adm cordon worker-03      # marks node unschedulable
+oc adm drain worker-03 \
+  --delete-emptydir-data \
+  --ignore-daemonsets        # triggers live migration for all VMs on node
+10.5 & 10.6 — Descheduling VMs from Nodes
+Problem: Over time, your cluster becomes unbalanced. worker-01 has 12 VMs, worker-05 has 2 VMs — even though both have the same capacity. Live migration moved VMs off drained nodes but nobody moved them back.
+
+Descheduler = automatic cluster rebalancer — it watches node load and evicts VMs from overloaded nodes, triggering live migration to lighter nodes.
+
+text
+Cluster state BEFORE Descheduler:
+  worker-01: CPU 85% used  (12 VMs)  ← overloaded
+  worker-02: CPU 72% used  (9 VMs)
+  worker-03: CPU 45% used  (5 VMs)
+  worker-04: CPU 20% used  (2 VMs)   ← underloaded
+
+Descheduler detects imbalance:
+  Cluster average CPU = 55.5%
+  worker-01 exceeds average by >10%  → evict VMs from worker-01
+
+Descheduler action:
+  Evict VM-A from worker-01  ──▶  live migrate to worker-04
+  Evict VM-B from worker-01  ──▶  live migrate to worker-04
+
+Cluster state AFTER:
+  worker-01: CPU 65%  (10 VMs)
+  worker-02: CPU 72%  (9 VMs)
+  worker-03: CPU 45%  (5 VMs)
+  worker-04: CPU 42%  (4 VMs)  ← balanced
+Two Descheduler profiles for VMs:
+
+Profile	When it acts	Based on
+DevKubeVirtRelieveAndMigrate	Node CPU > cluster average + 10%	CPU utilization
+PSI-based mode (kicks in at 80%+)	Cluster-wide CPU > 80%	CPU pressure (contention, not just usage)
+Important — VMs must opt in to be descheduled:
+
+text
+# VM must have this annotation to be eligible for descheduling
+metadata:
+  annotations:
+    descheduler.alpha.kubernetes.io/evict: "true"
+# Without this annotation → Descheduler will NOT touch the VM
+Full Chapter 10 Flow in One Picture
+text
+New VM deployment request
+     │
+     ▼
+Scheduler evaluates placement rules:
+  ├── nodeSelector   → must match node labels?
+  ├── nodeAffinity   → prefer/require certain nodes?
+  ├── podAntiAffinity→ keep apart from other VMs?
+  └── Tolerations    → allowed on tainted nodes?
+     │
+     ▼
+VM lands on correct node (worker-02)
+     │
+     │  Time passes → node needs maintenance OR cluster becomes unbalanced
+     ▼
+Live Migration triggered (manual / drain / descheduler)
+  ├── RWX PVC confirmed
+  ├── Memory copied iteratively to target node
+  ├── Final cutover (milliseconds)
+  └── VM continues on new node, users see zero downtime
+     │
+     ▼
+Descheduler watches cluster continuously
+  ├── Node overloaded → evict VM → live migrate → rebalance
+  └── Respects all affinity/anti-affinity rules during rebalance
